@@ -1,0 +1,52 @@
+# =========================
+# Android / Gradle
+# =========================
+.gradle/
+**/.gradle/
+
+build/
+**/build/
+
+# Android Studio local files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local Android SDK path
+local.properties
+**/local.properties
+
+# Native Android generated files
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Android output files
+*.apk
+*.aab
+*.ap_
+*.aar
+
+# Signing keys - do not upload
+*.jks
+*.keystore
+keystore.properties
+
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Generated / tool output
+# =========================
+structure.txt
+graphify-out/
+
+# =========================
+# AI agent config (local)
+# =========================
+AGENT.md

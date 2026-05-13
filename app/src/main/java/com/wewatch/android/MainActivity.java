@@ -55,6 +55,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+    private static final String PREFS_NAME = "wewatch";
+    private static final String KEY_LAST_MEDIA_NAME = "lastMediaName";
+    private static final String KEY_LAST_MEDIA_TIME_MS = "lastMediaTimeMs";
+    private static final String KEY_LAST_MEDIA_SAVED_AT = "lastMediaSavedAt";
+    private static final String KEY_OVERLAY_PERMISSION_ASKED = "overlayPermissionAsked";
     private static final int REQUEST_OPEN_MEDIA = 2001;
     private static final int REQUEST_INSTALL_PERMISSION = 2002;
     private static final String APK_MIME_TYPE = "application/vnd.android.package-archive";
@@ -81,6 +86,7 @@ public class MainActivity extends Activity {
     private TextView versionText;
     private TextView mediaTitle;
     private TextView mediaMeta;
+    private TextView lastPlayedInfo;
     private TextView sessionStats;
     private TextView peopleText;
     private TextView eventLog;
@@ -108,6 +114,7 @@ public class MainActivity extends Activity {
     private TextView vlcStatusText;
     private TextView audioTrackLabel;
     private TextView subtitleTrackLabel;
+    private ToastManager toastManager;
     private Spinner audioTrackSpinner;
     private Spinner subtitleTrackSpinner;
     private View subtitleDelayRow;
@@ -157,6 +164,9 @@ public class MainActivity extends Activity {
     private volatile boolean vlcPollInFlight = false;
     private boolean keepAliveServiceRunning = false;
     private long lastVlcStatusAt = 0;
+    private String lastPlayedFileName = "";
+    private long lastPlayedTimeMs = 0;
+    private long lastPlayedSavedAt = 0;
 
     private final BroadcastReceiver updateDownloadReceiver = new BroadcastReceiver() {
         @Override
@@ -260,7 +270,17 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        persistCurrentLastPlayed(true);
+        super.onPause();
+    }
+
+    @Override
     protected void onDestroy() {
+        persistCurrentLastPlayed(true);
+        if (toastManager != null) {
+            toastManager.clear();
+        }
         handler.removeCallbacksAndMessages(null);
         expectedClose = true;
         hostReconnectEnabled = false;
@@ -308,6 +328,7 @@ public class MainActivity extends Activity {
         versionText = findViewById(R.id.versionText);
         mediaTitle = findViewById(R.id.mediaTitle);
         mediaMeta = findViewById(R.id.mediaMeta);
+        lastPlayedInfo = findViewById(R.id.lastPlayedInfo);
         sessionStats = findViewById(R.id.sessionStats);
         peopleText = findViewById(R.id.peopleText);
         eventLog = findViewById(R.id.eventLog);
@@ -342,6 +363,9 @@ public class MainActivity extends Activity {
         pauseButton = findViewById(R.id.pauseButton);
         forwardButton = findViewById(R.id.forwardButton);
         syncButton = findViewById(R.id.syncButton);
+
+        ViewGroup toastContainer = findViewById(R.id.toastContainer);
+        toastManager = new ToastManager(this, toastContainer);
     }
 
     private void setupAdaptiveLayout() {
@@ -376,7 +400,7 @@ public class MainActivity extends Activity {
     }
 
     private void restoreSettings() {
-        SharedPreferences prefs = getSharedPreferences("wewatch", MODE_PRIVATE);
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         nameInput.setText(prefs.getString("name", ""));
         hostInput.setText(prefs.getString("host", ""));
         portInput.setText(prefs.getString("port", "3000"));
@@ -384,11 +408,15 @@ public class MainActivity extends Activity {
         vlcSecretInput.setText(prefs.getString("vlcSecret", ""));
         autoFollowSwitch.setChecked(prefs.getBoolean("autoFollow", true));
         darkTheme = prefs.getBoolean("darkTheme", true);
+        lastPlayedFileName = prefs.getString(KEY_LAST_MEDIA_NAME, "");
+        lastPlayedTimeMs = prefs.getLong(KEY_LAST_MEDIA_TIME_MS, 0);
+        lastPlayedSavedAt = prefs.getLong(KEY_LAST_MEDIA_SAVED_AT, 0);
+        renderLastPlayedUi();
         vlcRemoteClient.configure(vlcUrlInput.getText().toString(), vlcSecretInput.getText().toString());
     }
 
     private void saveSettings() {
-        getSharedPreferences("wewatch", MODE_PRIVATE)
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .edit()
                 .putString("name", nameInput.getText().toString().trim())
                 .putString("host", hostInput.getText().toString().trim())
@@ -479,6 +507,7 @@ public class MainActivity extends Activity {
             updateLocalStatus();
             publishStatus();
             sendAction("play", actionWithTime(currentStatus.time));
+            showLocalActionMessage("Playing at " + formatTime(currentStatus.time), "play");
         });
 
         pauseButton.setOnClickListener(view -> {
@@ -488,6 +517,7 @@ public class MainActivity extends Activity {
             updateLocalStatus();
             publishStatus();
             sendAction("pause", actionWithTime(currentStatus.time));
+            showLocalActionMessage("Paused at " + formatTime(currentStatus.time), "pause");
         });
 
         syncButton.setOnClickListener(view -> {
@@ -526,6 +556,7 @@ public class MainActivity extends Activity {
                 } catch (JSONException ignored) {
                 }
                 sendAction("seek", action);
+                showLocalActionMessage("Sought to " + formatTime(target), "seek");
             }
         });
     }
@@ -567,11 +598,12 @@ public class MainActivity extends Activity {
         seekBar.setProgress(0);
         seekBar.setMax(1);
         openMediaInVlc(uri);
-        log("Opened in VLC: " + mediaName);
         suppressObservedChanges();
         sendAction("file", actionWithFile(mediaName));
         updateLocalStatus();
+        rememberLastPlayed(currentStatus, true);
         publishStatus();
+        showLocalActionMessage("Selected " + mediaName, "file");
     }
 
     private void openCurrentMediaInVlc() {
@@ -671,6 +703,7 @@ public class MainActivity extends Activity {
                     handleVlcStatus(status);
                     updateVlcBridgeUi();
                     log("VLC bridge connected");
+                    maybePromptOverlayPermission();
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {
@@ -703,6 +736,7 @@ public class MainActivity extends Activity {
                         return;
                     }
                     if (System.currentTimeMillis() - lastVlcStatusAt > 7000) {
+                        persistCurrentLastPlayed(true);
                         vlcBridgeConnected = false;
                         updateVlcBridgeUi();
                         log("VLC bridge disconnected: " + cleanError(error));
@@ -939,6 +973,7 @@ public class MainActivity extends Activity {
     }
 
     private void disconnectFromHost() {
+        persistCurrentLastPlayed(true);
         expectedClose = true;
         hostReconnectEnabled = false;
         hostReconnectPending = false;
@@ -1221,6 +1256,35 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void maybePromptOverlayPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this) || isFinishing()) {
+            return;
+        }
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(KEY_OVERLAY_PERMISSION_ASKED, false)) {
+            return;
+        }
+        prefs.edit().putBoolean(KEY_OVERLAY_PERMISSION_ASKED, true).apply();
+
+        new AlertDialog.Builder(this)
+                .setTitle("Enable VLC overlay")
+                .setMessage("Allow display over other apps to show WeWatch session toasts over VLC.")
+                .setPositiveButton("Open settings", (dialog, which) -> openOverlaySettings())
+                .setNegativeButton("Later", null)
+                .show();
+    }
+
+    private void openOverlaySettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception error) {
+            log("Could not open overlay settings");
+        }
+    }
+
     private void openUrl(String url) {
         if (url == null || url.trim().isEmpty()) {
             return;
@@ -1398,7 +1462,7 @@ public class MainActivity extends Activity {
     private void styleTextTree(View view) {
         if (view instanceof TextView) {
             TextView text = (TextView) view;
-            text.setTextColor(text == sessionSummary || text == versionText || text == mediaMeta || text == vlcStatusText || text == peopleText || text == eventLog || text == updateStatusText || text == footerText || text == footerVersionText
+            text.setTextColor(text == sessionSummary || text == versionText || text == mediaMeta || text == lastPlayedInfo || text == vlcStatusText || text == peopleText || text == eventLog || text == updateStatusText || text == footerText || text == footerVersionText
                     ? mutedColor
                     : textColor);
         }
@@ -1531,7 +1595,9 @@ public class MainActivity extends Activity {
 
             if ("event".equals(type)) {
                 JSONObject event = data.optJSONObject("event");
-                log(data.optString("message", event != null ? event.optString("message", "Session event") : "Session event"));
+                String eventMessage = data.optString("message", event != null ? event.optString("message", "Session event") : "Session event");
+                String kind = event != null ? event.optString("kind", "event") : "event";
+                logSessionEvent(eventMessage, kind);
                 return;
             }
 
@@ -1688,6 +1754,7 @@ public class MainActivity extends Activity {
             status.position = status.length > 0 ? clamp(status.time / status.length, 0, 1) : 0;
             status.state = vlcStatus.state;
             currentStatus = status;
+            rememberLastPlayed(currentStatus, false);
             return;
         }
 
@@ -1705,6 +1772,7 @@ public class MainActivity extends Activity {
         status.position = 0;
         status.state = "paused";
         currentStatus = status;
+        rememberLastPlayed(currentStatus, false);
     }
 
     private void updatePlaybackUi() {
@@ -1774,6 +1842,7 @@ public class MainActivity extends Activity {
         } catch (JSONException ignored) {
         }
         sendAction("seek", action);
+        showLocalActionMessage("Sought to " + formatTime(currentStatus.time), "seek");
     }
 
     private boolean isPlaying() {
@@ -1827,13 +1896,14 @@ public class MainActivity extends Activity {
 
         String kind = action.optString("kind", "");
         if ("file".equals(kind)) {
-            log(actorName + " selected " + action.optString("filename", "a file"));
+            logSessionEvent(actorName + " selected " + action.optString("filename", "a file"), "file");
             return;
         }
         if ("sync".equals(kind)) {
             if (lastHostStatus != null) {
                 applyHostSync(lastHostStatus, "Synced", true);
             }
+            logSessionEvent("Synced", "sync");
             return;
         }
 
@@ -1864,6 +1934,8 @@ public class MainActivity extends Activity {
         } else {
             return;
         }
+
+        logSessionEvent(getActionMessage(kind, action, actorName), kind);
 
         handler.postDelayed(() -> {
             updateLocalStatus();
@@ -1920,7 +1992,12 @@ public class MainActivity extends Activity {
         }
 
         lastAutoSyncAt = System.currentTimeMillis();
-        log(label + " at " + formatTime(targetMs / 1000.0));
+        String message = label + " at " + formatTime(targetMs / 1000.0);
+        if (force) {
+            logSessionEvent(message, "sync");
+        } else {
+            log(message);
+        }
         handler.postDelayed(() -> {
             updateLocalStatus();
             publishStatus();
@@ -1979,7 +2056,7 @@ public class MainActivity extends Activity {
     }
 
     private void detectLocalVlcChange(PlaybackStatus previous, PlaybackStatus next) {
-        if (!isSocketOpen() || System.currentTimeMillis() < suppressLocalBroadcastUntil) {
+        if (System.currentTimeMillis() < suppressLocalBroadcastUntil) {
             return;
         }
         if (previous == null || next == null || "offline".equals(previous.state) || "offline".equals(next.state)) {
@@ -1991,7 +2068,11 @@ public class MainActivity extends Activity {
                 && !"No media".equals(next.filename);
 
         if (hasMedia && !sameText(previous.filename, next.filename)) {
-            sendAction("file", actionWithFile(next.filename, next.time, "vlc"));
+            if (isSocketOpen()) {
+                sendAction("file", actionWithFile(next.filename, next.time, "vlc"));
+            } else {
+                logSessionEvent("File changed: " + next.filename, "file");
+            }
             return;
         }
 
@@ -2001,9 +2082,17 @@ public class MainActivity extends Activity {
 
         if (!sameText(previous.state, next.state)) {
             if ("playing".equals(next.state)) {
-                sendAction("play", actionWithTime(next.time, "vlc"));
+                if (isSocketOpen()) {
+                    sendAction("play", actionWithTime(next.time, "vlc"));
+                } else {
+                    logSessionEvent("Playing at " + formatTime(next.time), "play");
+                }
             } else if ("paused".equals(next.state) || "stopped".equals(next.state) || "idle".equals(next.state)) {
-                sendAction("pause", actionWithTime(next.time, "vlc"));
+                if (isSocketOpen()) {
+                    sendAction("pause", actionWithTime(next.time, "vlc"));
+                } else {
+                    logSessionEvent("Paused at " + formatTime(next.time), "pause");
+                }
             }
             return;
         }
@@ -2019,7 +2108,11 @@ public class MainActivity extends Activity {
                 action.put("state", next.state);
             } catch (JSONException ignored) {
             }
-            sendAction("seek", action);
+            if (isSocketOpen()) {
+                sendAction("seek", action);
+            } else {
+                logSessionEvent("Sought to " + formatTime(next.time), "seek");
+            }
         }
     }
 
@@ -2081,6 +2174,97 @@ public class MainActivity extends Activity {
             }
         }
         eventLog.setText(builder.toString());
+    }
+
+    private void showOsdMessage(String message, String kind) {
+        if (toastManager != null) {
+            toastManager.showToast(message, kind);
+        }
+    }
+
+    private void showLocalActionMessage(String message, String kind) {
+        if (isSocketOpen()) {
+            return;
+        }
+        logSessionEvent(message, kind);
+    }
+
+    private String getActionMessage(String kind, JSONObject action, String actorName) {
+        if ("play".equals(kind)) {
+            double time = action.optDouble("time", 0);
+            return actorName + " played at " + formatTime(time);
+        } else if ("pause".equals(kind)) {
+            double time = action.optDouble("time", 0);
+            return actorName + " paused at " + formatTime(time);
+        } else if ("seek".equals(kind)) {
+            double time = action.optDouble("time", 0);
+            return actorName + " sought to " + formatTime(time);
+        }
+        return actorName + " performed " + kind;
+    }
+
+    private void logSessionEvent(String message, String kind) {
+        log(message);
+        showOsdMessage(message, kind);
+    }
+
+    private void rememberLastPlayed(PlaybackStatus status, boolean force) {
+        if (status == null) {
+            return;
+        }
+
+        String filename = firstNonEmpty(status.filename, mediaName);
+        if (filename.isEmpty() || "No media".equals(filename)) {
+            return;
+        }
+
+        long timeMs = Math.max(0, Math.round(status.time * 1000.0));
+        boolean fileChanged = !sameText(lastPlayedFileName, filename);
+        boolean timeChangedEnough = Math.abs(lastPlayedTimeMs - timeMs) >= 5000;
+        long now = System.currentTimeMillis();
+
+        lastPlayedFileName = filename;
+        lastPlayedTimeMs = timeMs;
+        renderLastPlayedUi();
+
+        if (!force && !fileChanged && !timeChangedEnough && now - lastPlayedSavedAt < 5000) {
+            return;
+        }
+
+        lastPlayedSavedAt = now;
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_LAST_MEDIA_NAME, lastPlayedFileName)
+                .putLong(KEY_LAST_MEDIA_TIME_MS, lastPlayedTimeMs)
+                .putLong(KEY_LAST_MEDIA_SAVED_AT, lastPlayedSavedAt)
+                .apply();
+    }
+
+    private void persistCurrentLastPlayed(boolean force) {
+        if (currentStatus != null && currentStatus.filename != null && !"No media".equals(currentStatus.filename)) {
+            rememberLastPlayed(currentStatus, force);
+            return;
+        }
+
+        if (vlcStatus != null && vlcStatus.available) {
+            PlaybackStatus status = new PlaybackStatus();
+            status.filename = firstNonEmpty(vlcStatus.filename, vlcStatus.title, mediaName);
+            status.time = Math.max(0, vlcStatus.projectedTimeMs()) / 1000.0;
+            rememberLastPlayed(status, force);
+        }
+    }
+
+    private void renderLastPlayedUi() {
+        if (lastPlayedInfo == null) {
+            return;
+        }
+
+        if (lastPlayedFileName == null || lastPlayedFileName.trim().isEmpty()) {
+            lastPlayedInfo.setText("Last played: Nothing");
+            return;
+        }
+
+        lastPlayedInfo.setText("Last played: " + lastPlayedFileName + " at " + formatTime(lastPlayedTimeMs / 1000.0));
     }
 
     private String formatTime(double value) {
